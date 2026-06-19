@@ -248,3 +248,111 @@ WHERE notificationType = 'Placement'
   AND createdAt >= NOW() - INTERVAL '7 days';
 ```
 *(Note: To make this query highly performant, a composite index on `(notificationType, createdAt)` is recommended.)*
+
+---
+
+## Stage 4: Database Performance & Caching
+
+To solve the database bottleneck caused by students fetching notifications on every page load:
+
+### 1. Strategies & Performance Optimizations
+
+#### A. Redis Caching (Cache-Aside Pattern)
+Store a student's recent notifications and unread counts in Redis.
+- **How it works**: On page load, the application checks Redis first. If found, returns immediately. If a cache miss occurs, it queries PostgreSQL, populates Redis, and returns.
+- **Tradeoffs**:
+  - *Pros*: Extremely low read latency (sub-millisecond) and shields the primary database from read traffic.
+  - *Cons*: Cache invalidation complexity. When a new notification is created, the cache for that student must be invalidated or updated.
+
+#### B. Connection Pooling (PgBouncer)
+Utilize a lightweight connection pooler to manage database connections.
+- **How it works**: Share a small pool of physical database connections among thousands of client connections.
+- **Tradeoffs**:
+  - *Pros*: Prevents the database from hitting connection limits and reduces memory overhead.
+  - *Cons*: Slight routing latency overhead, though negligible.
+
+#### C. Read Replicas
+Deploy read-only replicas of the database and direct all GET queries to them.
+- **How it works**: Primary database handles write traffic (inserts/updates). Replicas replicate data asynchronously and handle all notification fetches.
+- **Tradeoffs**:
+  - *Pros*: Scales read capacity horizontally.
+  - *Cons*: Replication lag. A student might not see a newly generated notification for a fraction of a second.
+
+---
+
+## Stage 5: Scaling Bulk Operations
+
+### 1. Shortcomings of the Initial Loop
+- **Synchronous Execution**: Running a loop over 50,000 students and calling third-party email APIs synchronously is blocking. If one email call takes 100ms, the entire process takes 1.4 hours.
+- **Lack of Fault Tolerance**: If the script crashes or the email API fails midway (e.g., at student 200), the execution stops, leaving the remaining 49,800 students without notifications.
+- **No Transaction Isolation**: Mixing database operations with network calls (`send_email`) inside the same loop can hold open database connections and cause lock contention.
+
+### 2. Reliable & Fast Redesign
+- **Decouple Database and Email**: Writing to the database is extremely fast. Sending emails is slow and unreliable. These processes must happen independently.
+- **Message Queue Broker**: Publish the bulk notification job to a message queue (e.g., RabbitMQ or Redis/BullMQ).
+- **Worker Workers**: Background worker processes consume tasks from the queue in parallel, chunking the 50,000 operations into small batches.
+- **Retry Mechanism**: If sending an email fails for a specific student, the worker retries only that specific task with exponential backoff.
+
+### 3. Revised Pseudocode (Message Queue Worker)
+
+```javascript
+// Publisher (HTTP Request Handler)
+async function triggerBulkNotification(notificationData) {
+  const job = {
+    title: notificationData.title,
+    message: notificationData.message,
+    type: notificationData.type
+  };
+  await notificationQueue.add("bulk-notify", job);
+}
+
+// Queue Consumer (Background Worker)
+async function processBulkNotificationJob(job) {
+  const { title, message, type } = job.data;
+  
+  // 1. Fetch all student IDs (fast index read)
+  const studentIds = await db.select("id").from("students");
+  
+  // 2. Insert notifications to DB in a single bulk transaction
+  const dbRecords = studentIds.map(id => ({
+    student_id: id,
+    title,
+    message,
+    notification_type: type,
+    is_read: false
+  }));
+  await db.batchInsert("notifications", dbRecords, 1000);
+  
+  // 3. Queue individual email tasks to be processed concurrently
+  const emailJobs = studentIds.map(id => ({
+    name: "send-student-email",
+    data: { studentId: id, message }
+  }));
+  await emailQueue.addBulk(emailJobs);
+  
+  // 4. Broadcast real-time websocket/SSE alert
+  await redis.publish("realtime-notifications", JSON.stringify({ title, type }));
+}
+```
+
+---
+
+## Stage 6: Priority Inbox Implementation
+
+### 1. Priority Sorting Strategy
+Priority is calculated using:
+- **Weight**: Placement (3) > Result (2) > Event (1).
+- **Recency**: Chronological sort descending based on the timestamp.
+
+### 2. Maintaining the Top 10 Efficiently
+To maintain the top 10 notifications dynamically in memory without resorting the entire array upon every new arrival:
+- **Approach**: Use a **Min-Heap (Priority Queue)** of size 10.
+- **Complexity**: 
+  - Inserting a new notification into a heap of size 10 takes $O(\log 10) \approx O(1)$ constant time.
+  - When a new notification arrives:
+    1. If the heap contains fewer than 10 items, push the new item.
+    2. If the heap contains 10 items, compare the new notification's priority with the root (which represents the lowest priority in the current top 10).
+    3. If the new item has a higher priority than the root, pop the root and push the new item.
+    4. Otherwise, discard it.
+- This avoids sorting the entire list of $N$ notifications, which would take $O(N \log N)$ time.
+

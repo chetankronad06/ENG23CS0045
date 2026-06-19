@@ -140,6 +140,10 @@ export async function Log(stack, level, pkg, message) {
   }
 }
 
+export async function getAuthToken() {
+  return await getOrRefreshToken();
+}
+
 export function expressLogger() {
   return (req, res, next) => {
     const start = Date.now();
