@@ -16,7 +16,8 @@
     "@mui/icons-material": "^9.1.1",
     "@mui/material": "^9.1.1",
     "react": "^19.2.6",
-    "react-dom": "^19.2.6"
+    "react-dom": "^19.2.6",
+    "logging-middleware": "file:../logging-middleware"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
